@@ -2,6 +2,8 @@
 
 Kód pro spolehlivý měřák napětí, proudu a výkonu. Původně vycházím z projektu, který před lety ukázal youtuber GreatScott. Jeho základní hardwarové zapojení bylo fajn, ale s jeho verzí softwaru a ořezanými funkcemi jsem prostě nebyl spokojený. Takže tohle je výsledek – napsané tak, aby to běželo stabilně, nezasekávalo se to a bez problémů se to vešlo do malé paměti Arduina Pro Mini.
 
+![Můj zapojený měřák s INA219](HK81ztgXwAI8Y09.jpeg)
+
 ## Hardware
 * Arduino Pro Mini
 * INA219 (měřicí modul, I2C komunikace napřímo bez velkých knihoven)
