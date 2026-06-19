@@ -75,7 +75,7 @@ enum CalState : uint8_t {
 // -----------------------------------------------------------------------------
 // Objects
 // -----------------------------------------------------------------------------
-U8X8_SH1106_128X64_NONAME_HW_I2C u8x8(U8X8_PIN_NONE);
+U8X8_SSD1306_128X64_NONAME_HW_I2C u8x8(U8X8_PIN_NONE);
 SdFat  sd;
 SdFile logFile;
 
@@ -96,6 +96,14 @@ float peakCurrentMA   = 0.0f;
 float minVoltage      = 9999.0f;
 float maxVoltage      = -9999.0f;
 float maxCurrentMA    = 0.0f;
+float maxPower        = 0.0f;     // running max power (mW)
+bool  holdResetReq    = false;    // long-press sets this; serviced after
+                                  // sensor read so reset uses clean values
+
+// Marker LED flash (non-blocking)
+#define MARKER_LED_MS   180UL     // flash duration in ms
+bool          ledOn          = false;
+unsigned long ledOffAt       = 0;  // millis() at which to turn the LED off
 bool  emaInit         = false;
 
 // Button state for short / long press (non-blocking)
@@ -109,6 +117,7 @@ bool          longFired        = false;
 
 // Calibration wizard runtime
 CalState      calState         = CAL_IDLE;
+bool          isCalibrating    = false;  // true while cal wizard owns the OLED
 uint8_t       calMode          = 0;     // 0 = voltage, 1 = current
 uint8_t       calStep          = 0;     // 0–2
 float         calRaw[3];               // frozen raw INA219 readings
@@ -235,33 +244,6 @@ static void buildUptimeRow(char* ut) {
 // OLED helpers
 // =============================================================================
 
-// Print a single 8x8 row padded to exactly 16 chars to clear stale content.
-// Cursor must be set by caller.
-static void oledPrintRow(const __FlashStringHelper* msg) {
-    // Print the flash string, then pad with spaces to col 16
-    // We track length by printing char-by-char from PROGMEM.
-    const char* p = (const char*)msg;
-    uint8_t len = 0;
-    char c;
-    while ((c = pgm_read_byte(p++)) != '\0') { u8x8.print(c); len++; }
-    while (len++ < 16) u8x8.print(' ');
-}
-
-// Two-line (double-height) OLED prompt used during calibration.
-// row: starting tile row (0,2,4 …)
-// line1/line2: flash strings, each ≤ 16 chars.
-static void oledCalPrompt(uint8_t row,
-                          const __FlashStringHelper* line1,
-                          const __FlashStringHelper* line2)
-{
-    u8x8.setFont(u8x8_font_chroma48medium8_r);
-    u8x8.setCursor(0, row);     oledPrintRow(line1);
-    u8x8.setCursor(0, row + 1); oledPrintRow(line2);
-}
-
-// Fill the entire screen with blank tiles (used on cal entry/exit).
-static void oledClearAll() { u8x8.clear(); }
-
 // =============================================================================
 // Calibration wizard — OLED prompt strings (all in flash)
 // =============================================================================
@@ -272,12 +254,6 @@ const char CAL_V2_L1[] PROGMEM = "Set supply ~12V";
 const char CAL_I0_L1[] PROGMEM = "Set load ~20mA";
 const char CAL_I1_L1[] PROGMEM = "Set load ~500mA";
 const char CAL_I2_L1[] PROGMEM = "Set load ~1000mA";
-const char CAL_BTN[]   PROGMEM = "Press BTN to snap";
-const char CAL_SER[]   PROGMEM = "Enter meter val:";
-const char CAL_DONE_L1[] PROGMEM = "Cal done!";
-const char CAL_DONE_L2[] PROGMEM = "Saved to EEPROM";
-const char CAL_ABORT_L1[] PROGMEM = "Cal ABORTED";
-const char CAL_ABORT_L2[] PROGMEM = "No changes saved";
 
 // Pointer tables in flash — indexed [step]
 const char* const CAL_V_L1[3] PROGMEM = { CAL_V0_L1, CAL_V1_L1, CAL_V2_L1 };
@@ -290,6 +266,27 @@ static const __FlashStringHelper* calPromptLine(uint8_t mode, uint8_t step) {
         ? (const char* const*)CAL_V_L1
         : (const char* const*)CAL_I_L1;
     return (const __FlashStringHelper*)pgm_read_ptr(&tbl[step]);
+}
+
+// =============================================================================
+// drawCalScreen — one-time styled "CALIBRATION" banner. Called once at wizard
+// entry; the display is then left completely static until the wizard exits.
+//
+//   Row 1: ================  (16 '=' — full-width top rule)
+//   Row 3:    CALIBRATION    (centered title)
+//   Row 4:   VOLTAGE MODE    (or CURRENT MODE — centered subtitle)
+//   Row 6: ================  (16 '=' — full-width bottom rule)
+// =============================================================================
+static void drawCalScreen(uint8_t mode) {
+    u8x8.clear();
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
+    // Top and bottom rules — exactly 16 '=' fill the panel width
+    u8x8.drawString(0, 1, "================");
+    u8x8.drawString(0, 6, "================");
+    // Centered title: "CALIBRATION" is 11 chars → start at col 3 (≈ centered)
+    u8x8.drawString(3, 3, "CALIBRATION");
+    // Centered subtitle by mode: "VOLTAGE MODE"/"CURRENT MODE" are 12 chars → col 2
+    u8x8.drawString(2, 4, mode == 0 ? "VOLTAGE MODE" : "CURRENT MODE");
 }
 
 // =============================================================================
@@ -311,24 +308,10 @@ static bool runCalSM() {
     switch (calState) {
 
         // ── CAL_SET_SOURCE ────────────────────────────────────────────────────
-        // Show OLED prompt for this step; move straight to button-wait.
+        // Take ownership of the OLED, wipe every row cleanly, then paint the
         case CAL_SET_SOURCE: {
-            oledClearAll();
-
-            // Line 0-1: target prompt
-            u8x8.setFont(u8x8_font_chroma48medium8_r);
-            u8x8.setCursor(0, 0);
-            oledPrintRow(calPromptLine(calMode, calStep));
-            u8x8.setCursor(0, 1);
-            oledPrintRow((const __FlashStringHelper*)CAL_BTN);
-
-            // Line 2: step counter "Step X/3"
-            u8x8.setCursor(0, 3);
-            u8x8.print(F("Step "));
-            u8x8.print(calStep + 1);
-            u8x8.print(F("/3  Q=abort  "));
-
-            // Serial mirror
+            // Display is left untouched (static "CALIBRATION" message stays).
+            // All step guidance goes to Serial only.
             Serial.print(F("[Cal step ")); Serial.print(calStep + 1);
             Serial.print(F("/3] ")); Serial.println(calPromptLine(calMode, calStep));
             Serial.println(F("Press the MARKER button to capture, or Q to abort."));
@@ -340,27 +323,13 @@ static bool runCalSM() {
         // ── CAL_WAIT_BUTTON ───────────────────────────────────────────────────
         // Spin here until physical button fires (btnPressed flag) or abort.
         case CAL_WAIT_BUTTON: {
-            if (btnPressed) {
-                btnPressed = false;
+            if (btnShortPress) {
+                btnShortPress = false;
 
                 // Freeze raw INA219 reading for this step
                 calRaw[calStep] = (calMode == 0) ? getRawVoltage() : getRawCurrentMA();
 
-                // Show "frozen" feedback on OLED row 5
-                {
-                    char b[10];
-                    u8x8.setCursor(0, 5);
-                    u8x8.print(F("Raw:"));
-                    dtostrf(calRaw[calStep], 8, 4, b);
-                    u8x8.print(b);
-                }
-
-                // Update OLED row 6-7 to ask for Serial input
-                u8x8.setCursor(0, 6);
-                oledPrintRow((const __FlashStringHelper*)CAL_SER);
-                u8x8.setCursor(0, 7);
-                oledPrintRow(F("(type + Enter)  "));
-
+                // Display untouched — report capture via Serial only
                 Serial.print(F("Raw captured: "));
                 {
                     char b[10];
@@ -438,16 +407,9 @@ static bool runCalSM() {
                 }
             }
 
-            // OLED confirmation
-            oledClearAll();
-            u8x8.setFont(u8x8_font_chroma48medium8_r);
-            u8x8.setCursor(0, 3);
-            oledPrintRow((const __FlashStringHelper*)CAL_DONE_L1);
-            u8x8.setCursor(0, 4);
-            oledPrintRow((const __FlashStringHelper*)CAL_DONE_L2);
-            delay(2000);
-
-            oledClearAll();
+            // Wizard finished — single clear, then hand display back to loop().
+            u8x8.clear();
+            isCalibrating = false;      // updateOLED resumes next loop pass
             calState = CAL_IDLE;
             return false;
         }
@@ -456,15 +418,9 @@ static bool runCalSM() {
         case CAL_ABORT: {
             Serial.println(F("Cal aborted. EEPROM unchanged."));
 
-            oledClearAll();
-            u8x8.setFont(u8x8_font_chroma48medium8_r);
-            u8x8.setCursor(0, 3);
-            oledPrintRow((const __FlashStringHelper*)CAL_ABORT_L1);
-            u8x8.setCursor(0, 4);
-            oledPrintRow((const __FlashStringHelper*)CAL_ABORT_L2);
-            delay(2000);
-
-            oledClearAll();
+            // Single clear, then hand display back to loop().
+            u8x8.clear();
+            isCalibrating = false;      // updateOLED resumes next loop pass
             calState = CAL_IDLE;
             return false;
         }
@@ -477,68 +433,101 @@ static bool runCalSM() {
 
 // =============================================================================
 // OLED — normal operation display
-// Row 0-1: Voltage + V-min  Row 2-3: Current  Row 4-5: Power
-// Row 6  : Peak-hold bar    Row 7  : Uptime + SD tag
+//
+// Layout (128x64 px = 16x8 tile grid). NO double-height glyph starts on row 0
+// (avoids the SSD1306 page-0 corruption). Row 0 is small-font status.
+//
+//   Row 0   : [small]   "0:00:12:34    SD"   uptime + SD health tag
+//   Row 1   : [small]   "min          peak"  faint labels for the holds below
+//   Row 2-3 : [1x2]     "V:  12.34 V"        voltage  (double-height)
+//   Row 4-5 : [1x2]     "I: 123.45mA"        current  (double-height)
+//   Row 6-7 : [1x2]     "P: 1.234 W"         power    (double-height)
+//
+// Decimal alignment: every value uses dtostrf width=7, so the decimal point
+// lands on the same tile column on all three large rows. The minVoltage and
+// peakCurrentMA holds are shown small on row 1 so they never disturb the big
+// value rows or their alignment.
 // =============================================================================
 static void updateOLED(float volts, float iMA, float pmW) {
-    char b[8];
+    // Safety net; the primary block is if(!isCalibrating) in loop().
+    if (isCalibrating) return;
+
+    char b[9];   // dtostrf(width=7) → 7 + sign + null = 9 worst case
+
+    // ── Row 0: uptime + SD status (small font) ───────────────────────────────
+    {
+        char ut[17];
+        buildUptimeRow(ut);            // "D:HH:MM:SS   SD" / " !SD"
+        u8x8.setFont(u8x8_font_chroma48medium8_r);
+        u8x8.setCursor(0, 0);
+        u8x8.print(ut);
+    }
+
+    // ── Row 1: small-font MIN / MAX hold readouts ────────────────────────────
+    // Left  cols 0-7 : "VMIN" + value (w=4 p=1)
+    // Right cols 8-15: "IMAX" + value (w=4 p=0, in mA)
+    // Both labels are 4 chars so the two halves are symmetric (8 + 8).
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
+    u8x8.setCursor(0, 1);
+    u8x8.print(F("VMIN"));
+    if (minVoltage > 999.0f) {
+        u8x8.print(F("----"));
+    } else {
+        dtostrf(minVoltage, 4, 1, b); u8x8.print(b);
+    }
+    u8x8.setCursor(8, 1);
+    u8x8.print(F("IMAX"));
+    dtostrf(maxCurrentMA, 4, 0, b); u8x8.print(b);
+
+    // ── Large value rows — UNIFORM FORMAT FOR PERFECT DECIMAL ALIGNMENT ───────
+    //
+    // Every value uses dtostrf(width=7, precision=2). Because width and
+    // precision are identical on all three rows, the decimal point lands on
+    // the exact same tile column (col 5) on every line, regardless of range.
+    //
+    //   Label (2) | number (7, w=7 p=2) | unit (7)  = 16 tiles
+    //   "V:"      | "  12.34"            | " V     "
+    //   "I:"      | " 123.45"            | " mA    "
+    //   "P:"      | "   1.23"            | " W     "
+    //               ^col2   ^col5 decimal
+    //
+    // Auto-ranging converts the magnitude (mA→A, mW→W) but KEEPS p=2 so the
+    // decimal column never moves. Labels are all 2 chars ("V:", "I:", "P:")
+    // so the number field always starts at the same column too.
 
     u8x8.setFont(u8x8_font_8x13B_1x2_r);
 
-    // Row 0-1 – Voltage + V-min ("V:  5.234 Vm5.2")
-    u8x8.setCursor(0, 0);
-    u8x8.print(F("V:"));
-    dtostrf(volts, 7, 3, b); u8x8.print(b);
-    u8x8.print(F(" V"));
-    u8x8.print('m');
-    if (minVoltage > 999.0f) { u8x8.print(F("---")); }
-    else { dtostrf(minVoltage, 3, 1, b); u8x8.print(b); }
-
-    // Row 2-3 – Current
+    // Rows 2-3: Voltage
     u8x8.setCursor(0, 2);
+    u8x8.print(F("V:"));
+    dtostrf(volts, 7, 2, b);
+    u8x8.print(b);
+    u8x8.print(F(" V     "));
+
+    // Rows 4-5: Current (auto-range mA / A, precision locked at 2)
+    u8x8.setCursor(0, 4);
     u8x8.print(F("I:"));
     if (iMA >= 1000.0f) {
-        dtostrf(iMA * 0.001f, 6, 3, b);
-        u8x8.print(b); u8x8.print(F(" A  "));
+        dtostrf(iMA * 0.001f, 7, 2, b);
+        u8x8.print(b);
+        u8x8.print(F(" A     "));
     } else {
-        dtostrf(iMA, 6, 1, b);
-        u8x8.print(b); u8x8.print(F("mA  "));
+        dtostrf(iMA, 7, 2, b);
+        u8x8.print(b);
+        u8x8.print(F(" mA    "));
     }
 
-    // Row 4-5 – Power
-    u8x8.setCursor(0, 4);
+    // Rows 6-7: Power (auto-range mW / W, precision locked at 2)
+    u8x8.setCursor(0, 6);
     u8x8.print(F("P:"));
     if (pmW >= 1000.0f) {
-        dtostrf(pmW * 0.001f, 6, 3, b);
-        u8x8.print(b); u8x8.print(F(" W  "));
+        dtostrf(pmW * 0.001f, 7, 2, b);
+        u8x8.print(b);
+        u8x8.print(F(" W     "));
     } else {
-        dtostrf(pmW, 6, 1, b);
-        u8x8.print(b); u8x8.print(F("mW  "));
-    }
-
-    u8x8.setFont(u8x8_font_chroma48medium8_r);
-
-    // Row 6 – Peak-hold VU bar
-    {
-        char line[17];
-        uint8_t live = (uint8_t)((iMA           / BAR_SCALE_MA) * 16.0f);
-        uint8_t pk   = (uint8_t)((peakCurrentMA / BAR_SCALE_MA) * 16.0f);
-        if (live > 16) live = 16;
-        if (pk   > 16) pk   = 16;
-        if (pk   >  0) pk--;
-        memset(line, ' ', 16); line[16] = '\0';
-        for (uint8_t c = 0; c < live; c++) line[c] = '=';
-        if (peakCurrentMA > 0.0f) line[pk] = '|';
-        u8x8.setCursor(0, 6);
-        u8x8.print(line);
-    }
-
-    // Row 7 – Uptime + SD tag
-    {
-        char ut[17];
-        buildUptimeRow(ut);
-        u8x8.setCursor(0, 7);
-        u8x8.print(ut);
+        dtostrf(pmW, 7, 2, b);
+        u8x8.print(b);
+        u8x8.print(F(" mW    "));
     }
 }
 
@@ -594,46 +583,48 @@ static void logToSD(float volts, float iMA, float pmW) {
 }
 
 // =============================================================================
-// Button poll — non-blocking short / long press, no delay().
-// Short press : button released before LONG_PRESS_MS  → btnShortPress flag.
-// Long press  : button held >= LONG_PRESS_MS          → btnLongPress flag
-//               (fires once while held; does not repeat).
+// Button poll — non-blocking, debounced. Marker fires INSTANTLY on the press
+// (falling edge) so the Serial "MARKER" appears at the exact moment of press,
+// not on release. Long-press (>= LONG_PRESS_MS) additionally triggers the
+// min/max reset while the button is still held.
+//
+//   Quick tap   → btnShortPress (marker only)
+//   Long hold   → btnShortPress on press + btnLongPress after 2 s (reset)
+//
+// Debounce: a state change must be stable for DEBOUNCE_MS before it counts.
+// pollButton() is called every loop() pass, so it keeps working even while
+// the SD card is mid-write (the write happens AFTER the flags are consumed).
 // =============================================================================
 static void pollButton() {
     bool raw = digitalRead(MARKER_PIN);
     unsigned long now = millis();
 
-    // Debounce: reset timer on any change
+    // Debounce: any raw change restarts the stability timer
     if (raw != lastBtnState) {
         lastDebounceTime = now;
         lastBtnState = raw;
     }
+    if ((now - lastDebounceTime) < DEBOUNCE_MS) return;  // not stable yet
 
-    if ((now - lastDebounceTime) < DEBOUNCE_MS) return; // still bouncing
-
-    // Stable LOW: button is being held
+    // ── Falling edge (HIGH→LOW): button just pressed ────────────────────────
     if (debounceState == HIGH && raw == LOW) {
-        // Falling edge — record press start
+        debounceState = LOW;
         btnPressStart = now;
         longFired     = false;
-        debounceState = LOW;
+        btnShortPress = true;   // INSTANT marker — consumed same loop pass
     }
 
-    // Still held: check for long-press threshold
+    // ── Still held: fire long-press reset once at the 2 s threshold ─────────
     if (debounceState == LOW && raw == LOW && !longFired) {
         if ((now - btnPressStart) >= LONG_PRESS_MS) {
             btnLongPress = true;
-            longFired    = true;  // one-shot: won't re-fire while held
+            longFired    = true;  // one-shot while held
         }
     }
 
-    // Rising edge: button released
+    // ── Rising edge (LOW→HIGH): button released ─────────────────────────────
     if (debounceState == LOW && raw == HIGH) {
-        debounceState = HIGH;
-        if (!longFired) {
-            btnShortPress = true;  // released before long-press threshold
-        }
-        longFired = false;
+        debounceState = HIGH;    // ready for next press; marker already fired
     }
 }
 
@@ -647,6 +638,8 @@ void setup() {
     eepromLoad();
 
     pinMode(MARKER_PIN, INPUT_PULLUP);
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
 
     Wire.begin();
     ina219_init();
@@ -677,6 +670,12 @@ void loop() {
     // ── Uptime tick ──────────────────────────────────────────────────────────
     if (now - lastUptimeTick >= 1000UL) { uptimeSec++; lastUptimeTick += 1000UL; }
 
+    // ── Non-blocking marker LED: turn off once the flash window elapses ──────
+    if (ledOn && (long)(now - ledOffAt) >= 0) {
+        digitalWrite(LED_BUILTIN, LOW);
+        ledOn = false;
+    }
+
     // ── Button poll (used by both wizard and normal marker logic) ─────────────
     pollButton();
 
@@ -691,11 +690,17 @@ void loop() {
         char cmd = (char)Serial.read();
         while (Serial.available()) Serial.read();
         if (cmd == 'v' || cmd == 'V') {
-            calMode = 0; calStep = 0; calState = CAL_SET_SOURCE;
+            calMode = 0; calStep = 0;
+            isCalibrating = true;            // loop() will not call updateOLED
+            drawCalScreen(0);                // ONE-TIME styled banner; static after
+            calState = CAL_SET_SOURCE;
             Serial.println(F("Starting voltage calibration. Q to abort."));
             return;
         } else if (cmd == 'i' || cmd == 'I') {
-            calMode = 1; calStep = 0; calState = CAL_SET_SOURCE;
+            calMode = 1; calStep = 0;
+            isCalibrating = true;            // loop() will not call updateOLED
+            drawCalScreen(1);                // ONE-TIME styled banner; static after
+            calState = CAL_SET_SOURCE;
             Serial.println(F("Starting current calibration. Q to abort."));
             return;
         } else if (cmd == 'z' || cmd == 'Z') {
@@ -703,19 +708,25 @@ void loop() {
         }
     }
 
-    // ── Button actions: short press = marker, long press = reset holds ─────
+    // ── Button actions: marker fires the instant the button is pressed ─────
     if (btnShortPress) {
         btnShortPress = false;
-        logMarker(F("MANUAL MARKER"));
-        Serial.println(F("--- MARKER ---"));
+        // Instant visual feedback: LED on now, scheduled off via millis().
+        digitalWrite(LED_BUILTIN, HIGH);
+        ledOn    = true;
+        ledOffAt = now + MARKER_LED_MS;
+        // Serial FIRST, flushed immediately so it appears in the terminal at
+        // the exact moment of the press — before the (slower) SD write.
+        Serial.println(F("MARKER"));
+        Serial.flush();                 // block until TX buffer is drained
+        logMarker(F("MANUAL MARKER"));  // then write+sync to the SD card
     }
     if (btnLongPress) {
         btnLongPress = false;
-        float snapV = getCalV();
-        float snapI = getCalIma();
-        if (snapI < 0.0f) snapI = 0.0f;
-        minVoltage    = snapV;   maxVoltage   = snapV;
-        peakCurrentMA = snapI;   maxCurrentMA = snapI;
+        // Defer the actual reset until AFTER the sensor readings are taken
+        // and clamped/filtered below — otherwise the baseline could be a raw
+        // negative/floating value and the holds would show negative numbers.
+        holdResetReq = true;
         logMarker(F("MIN/MAX RESET"));
         Serial.println(F("Long press: min/max/peak reset to live values."));
     }
@@ -730,7 +741,12 @@ void loop() {
     // ── Sensor readings ──────────────────────────────────────────────────────
     float volts = getCalV();
     float iMA   = getCalIma();
-    if (iMA < 0.0f) iMA = 0.0f;
+    // Clamp negative readings caused by floating/unconnected INA219 inputs.
+    // A real load can never produce negative bus voltage; negative shunt
+    // current (reverse current) is valid in some setups — keep it for current
+    // but clamp the bus voltage which is always >= 0 V physically.
+    if (volts < 0.0f) volts = 0.0f;
+    if (iMA   < 0.0f) iMA   = 0.0f;
 
     emaCurrentMA = emaInit
         ? EMA_ALPHA * iMA + (1.0f - EMA_ALPHA) * emaCurrentMA
@@ -740,13 +756,25 @@ void loop() {
 
     float pmW = volts * iMA;
 
-    // ── V-min hold ───────────────────────────────────────────────────────────
+    // ── Deferred hold reset (long-press) ─────────────────────────────────────
+    // Now that volts/iMA/pmW are the clamped, filtered values the display uses,
+    // seed every hold to the live baseline. No zeros, no raw/negative leakage,
+    // display and internal trackers synchronized in one place.
+    if (holdResetReq) {
+        holdResetReq  = false;
+        minVoltage    = volts;   maxVoltage   = volts;
+        peakCurrentMA = iMA;     maxCurrentMA = iMA;
+        maxPower      = pmW;
+    }
+
+    // ── V-min / V-max hold ───────────────────────────────────────────────────
     if (volts < minVoltage) minVoltage = volts;
     if (volts > maxVoltage) maxVoltage = volts;
 
-    // ── Peak-hold ────────────────────────────────────────────────────────────
+    // ── Peak / max hold ──────────────────────────────────────────────────────
     if (iMA >= peakCurrentMA) peakCurrentMA = iMA;
     if (iMA >  maxCurrentMA)  maxCurrentMA  = iMA;
+    if (pmW >  maxPower)      maxPower      = pmW;
     if (now - lastPeakDecay >= PEAK_DECAY_MS) {
         lastPeakDecay = now;
         if (peakCurrentMA > iMA) {
@@ -756,7 +784,9 @@ void loop() {
     }
 
     // ── Display ──────────────────────────────────────────────────────────────
-    updateOLED(volts, iMA, pmW);
+    if (!isCalibrating) {
+        updateOLED(volts, iMA, pmW);
+    }
 
     // ── Delta logging ────────────────────────────────────────────────────────
     bool doLog = (fabsf(volts - prevLogV) > LOG_V_DELTA)
