@@ -1,3 +1,10 @@
+Power Meter / Datalogger with 3-Point Calibration Wizard
+// Hardware: Arduino Pro Mini, INA219 (raw I2C), U8X8 SH1106 OLED, SdFat v2
+// Features: EEPROM cal storage, V-min hold, peak-hold bar, marker button,
+//           SD auto-recovery, diagnostic markers, delta logging,
+//           state-machine calibration wizard with abort & transactional save.
+
+
 # Arduino INA219 Power Meter & Datalogger
 
 Kód pro spolehlivý měřák napětí, proudu a výkonu. Původně vycházím z projektu, který před lety ukázal youtuber GreatScott. Jeho základní hardwarové zapojení bylo fajn, ale s jeho verzí softwaru a ořezanými funkcemi jsem prostě nebyl spokojený. Takže tohle je výsledek – napsané tak, aby to běželo stabilně, nezasekávalo se to a bez problémů se to vešlo do malé paměti Arduina Pro Mini.
